@@ -1,0 +1,33 @@
+# 本地环境（含个人路径）
+env.sh
+
+# 源码与编译产物
+mlc-build/
+build/
+3rdparty/
+*.so
+*.o
+*.a
+
+# 模型权重（用 05-convert-model.sh 现场生成，别提交）
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# Python
+mlc-venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# 日志与临时
+*.log
+tmp/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
