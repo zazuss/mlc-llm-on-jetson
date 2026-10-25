@@ -21,6 +21,23 @@ import time
 
 MSG = [{"role": "user", "content": "请用中文写一段关于机器人的短文。"}]
 
+# 填充语，用来造长 prompt。5.4 字符/token 是在 Qwen 分词器上实测出来的比值
+# （按 4 字符/token 估会短三分之一，导致"8K 档"实际只测了 5.5K）。
+FILLER = (
+    "The quick brown fox jumps over the lazy dog while a patient engineer "
+    "measures memory bandwidth on a small embedded board. "
+)
+CHARS_PER_TOKEN = 5.4
+
+
+def build_messages(prompt_tokens):
+    """prompt_tokens 为 0 → 默认短 prompt（测峰值）；>0 → 填充到目标长度（测真实速度）。"""
+    if not prompt_tokens:
+        return MSG
+    chars = int(prompt_tokens * CHARS_PER_TOKEN)
+    reps = chars // len(FILLER) + 1
+    return [{"role": "user", "content": (FILLER * reps)[:chars]}]
+
 
 def rate(prompt_tokens, completion_tokens, first_latency, total):
     """→ (prefill t/s, decode t/s)"""
@@ -33,9 +50,10 @@ def rate(prompt_tokens, completion_tokens, first_latency, total):
 
 # ---------------------------------------------------------------- 单流（进程内）
 
-def bench_inproc(model_dir, model_lib, n_tokens, rounds, warmup):
+def bench_inproc(model_dir, model_lib, n_tokens, rounds, warmup, messages=None):
     from mlc_llm import MLCEngine
 
+    messages = messages or MSG
     print(f"加载 {model_dir} …", flush=True)
     t0 = time.time()
     engine = MLCEngine(model=model_dir, device="cuda", model_lib=model_lib)
@@ -48,7 +66,7 @@ def bench_inproc(model_dir, model_lib, n_tokens, rounds, warmup):
         usage = None
         stream = engine.chat.completions.create(
             model=model_dir,
-            messages=MSG,
+            messages=messages,
             max_tokens=n,
             temperature=0.0,
             stream=True,
@@ -87,9 +105,10 @@ def bench_inproc(model_dir, model_lib, n_tokens, rounds, warmup):
 
 # ---------------------------------------------------------------- 多流（HTTP）
 
-def bench_http(url, n_tokens, concurrency, rounds):
+def bench_http(url, n_tokens, concurrency, rounds, messages=None):
     from openai import OpenAI
 
+    messages = messages or MSG
     client = OpenAI(base_url=f"{url.rstrip('/')}/v1", api_key="none")
     model = client.models.list().data[0].id
     print(f"服务 {url}  模型 {model}  并发 {concurrency}\n", flush=True)
@@ -100,7 +119,7 @@ def bench_http(url, n_tokens, concurrency, rounds):
         usage = None
         stream = client.chat.completions.create(
             model=model,
-            messages=MSG,
+            messages=messages,
             max_tokens=n_tokens,
             temperature=0.0,
             stream=True,
@@ -150,10 +169,15 @@ def main():
     ap.add_argument("--warmup", type=int, default=8, help="预热 token 数，0 关闭")
     ap.add_argument("--url", default=None, help="给了就走 HTTP 多流模式")
     ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--prompt-length", type=int, default=0,
+                    help="目标 prompt token 数；0=用默认 16 字短 prompt（峰值跑分）。"
+                         "测真实对话速度请设 2000 以上，否则数字会骗人")
     args = ap.parse_args()
 
+    messages = build_messages(args.prompt_length)
+
     if args.url:
-        bench_http(args.url, args.tokens, args.concurrency, args.rounds)
+        bench_http(args.url, args.tokens, args.concurrency, args.rounds, messages)
         return
 
     if not args.model_dir:
@@ -165,7 +189,7 @@ def main():
         print(f"✗ 找不到 {lib}（先跑 05-convert-model.sh）", file=sys.stderr)
         sys.exit(1)
 
-    bench_inproc(d, lib, args.tokens, args.rounds, args.warmup)
+    bench_inproc(d, lib, args.tokens, args.rounds, args.warmup, messages)
 
 
 if __name__ == "__main__":

@@ -118,6 +118,83 @@ pip install apache-tvm-ffi-orcjit==0.1.2
 
 ---
 
+## 运行期三个坑（不踩，长上下文测试全是假的）
+
+这三个坑的共同特征：**不报错，只是悄悄用 8192**。它们的调试成本远高于编译期那些，因为看起来完全正常。
+
+### 坑 ⑤ 不给 `model_lib` → JIT 重编 + 退回 8192
+
+**症状**：第一次跑 bench，加载阶段卡了 **152.1 秒**；之后想测 32K 被 `input length limit 8192` 拒掉，但 `mlc-chat-config.json` 里明明写着 `context_window_size: 40960`。
+
+**原因**：`MLCEngine` 不带 `model_lib` 时，检测到没有预编译产物，就在临时目录里 **JIT 重编一份**（日志里出现 `tmpfx_fbi8p/lib.so` 这种路径），用的是默认配置，上下文 8192。
+
+**修复**：
+
+```python
+MLCEngine(model=model_dir, device="cuda",
+          model_lib=f"{model_dir}/model_lib.so")   # 加载降到 9.7 s
+```
+
+**教训**：看到 `tmpXXXXXX` 出现在日志里，就是它在偷偷重编。
+
+### 坑 ⑥ 给了 `model_lib` 也还不够：`EngineConfig` 里还有一道 8192
+
+**症状**：`model_lib` 已经是用 `--overrides "context_window_size=32768"` 编出来的（`strings model_lib.so` 能查到 32768），加载也正常，但请求 32K 仍然被拒：`input length limit 8192`。
+
+**原因**：`EngineConfig.max_single_sequence_length` 和 `max_total_sequence_length` **默认都是 `None`**，C++ 引擎补上默认值 **8192**。它跟 model_lib 编进去的值毫无关系，限制取两者较小值：
+
+```python
+# python/mlc_llm/serve/engine_base.py
+limit = min(max_single_sequence_length, max_total_sequence_length)
+```
+
+**修复**：两个字段都显式设。
+
+```python
+from mlc_llm.serve import EngineConfig
+cfg = EngineConfig(max_single_sequence_length=32768,
+                   max_total_sequence_length=32768)
+MLCEngine(model=model_dir, device="cuda", model_lib=lib, engine_config=cfg)
+```
+
+**附带事实**：`mlc-chat-config.json` 里的 `context_window_size` 只是元数据，没有任何代码读它来限制长度。真正的上限由 `mlc_llm compile` 的 overrides 决定。
+
+### 坑 ⑦ `gpu_memory_utilization` 默认 0.85 → 初始化阶段就 OOM
+
+**症状**：上下文配对了，加载阶段直接崩：
+
+```
+RuntimeError: CUDA Runtime Error: cudaErrorMemoryAllocation (2): out of memory
+```
+
+调用栈顶是 `CachedPagedKVCacheAuxDataManager::CachedPagedKVCacheAuxDataManager` → `Tensor::Empty` → `cuda_device_api.cc:173 cudaMalloc`。**注意这不是推理中途 OOM，是引擎初始化时就 OOM。**
+
+**原因**：`gpu_memory_utilization` 默认 **0.85**，MLC 拿它反推能开多大的 KV cache。在 7.3 GiB 的板子上这个推算会超出实际可用量。
+
+**修复**：降到 0.5，并明确并发数。
+
+```python
+cfg = EngineConfig(max_single_sequence_length=16384,
+                   max_total_sequence_length=16384,
+                   gpu_memory_utilization=0.5,
+                   max_num_sequence=1)
+```
+
+> 32K 即使按上面三项全设对，仍然会 OOM —— 那是内存账算不平（923 + 3729 + 2680 = 7332 MB vs 7485 MB 可用），不是参数问题。见 [RESULTS.md](RESULTS.md) 第 6.2 节。
+
+### 顺带：`NvMap ... error 12` 会干扰诊断
+
+OOM 过程中会刷屏：
+
+```
+NvMapMemAllocInternalTagged failed: error 12
+NvMapMemHandleAlloc failed: error 12
+```
+
+**这是伴生噪声，不是根因。** 它们会让人以为是 CMA（Jetson 上著名的 256 MB 限制）不够。实测：`cudaMallocManaged` 分配 **4 GB** 成功、`cudaHostAlloc` 1 GB 成功，CMA 与 CUDA 分配路径完全无关。真正的错误永远在最后那行 `cudaErrorMemoryAllocation` 的调用栈里。
+
+---
+
 ## 其它坑（编译之外）
 
 ### MLC 的 Python 引擎不能多线程并发调
